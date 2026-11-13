@@ -1,0 +1,4 @@
+# 建议使用 Python 3.11（64 位）创建独立虚拟环境
+kivy
+openpyxl
+pyinstaller
