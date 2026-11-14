@@ -15,6 +15,8 @@
 
 import os
 from pathlib import Path
+from datetime import date, datetime, time
+from openpyxl.utils.datetime import from_excel
 
 from openpyxl import Workbook
 from openpyxl.styles import (
@@ -491,3 +493,125 @@ def export_salary(path, result):
         wb,
         path
     )
+
+
+def _excel_date(value):
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, (int, float)):
+        parsed = from_excel(value)
+        if isinstance(parsed, datetime):
+            return parsed.date().isoformat()
+        if isinstance(parsed, date):
+            return parsed.isoformat()
+    text = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y年%m月%d日", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    raise ValueError(f"无法识别日期：{value!r}")
+
+
+def _excel_time(value):
+    if isinstance(value, datetime):
+        return value.strftime("%H:%M")
+    if isinstance(value, time):
+        return value.strftime("%H:%M")
+    if isinstance(value, (int, float)):
+        parsed = from_excel(value)
+        if isinstance(parsed, datetime):
+            return parsed.strftime("%H:%M")
+        if isinstance(parsed, time):
+            return parsed.strftime("%H:%M")
+    text = str(value or "").strip()
+    for fmt in ("%H:%M", "%H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%H:%M")
+        except ValueError:
+            continue
+    raise ValueError(f"无法识别时间：{value!r}（请使用 HH:MM）")
+
+
+def import_records(source):
+    """Read and validate course records from an .xlsx file.
+
+    `source` may be a path or a seekable file-like object. Existing records are
+    not touched; the caller decides when to append the returned rows.
+    """
+    from openpyxl import load_workbook
+    from database import COLUMNS
+
+    workbook = load_workbook(source, data_only=True, read_only=True)
+    try:
+        sheet = workbook["课程记录"] if "课程记录" in workbook.sheetnames else workbook.active
+        values = sheet.iter_rows(values_only=True)
+        try:
+            header_row = next(values)
+        except StopIteration:
+            raise ValueError("Excel 文件为空。")
+
+        aliases = {
+            "日期": "日期", "上课日期": "日期",
+            "开始时间": "开始时间", "上课开始时间": "开始时间",
+            "结束时间": "结束时间", "上课结束时间": "结束时间",
+            "正常课时": "正常课时", "三倍课时": "三倍课时", "总课时": "总课时",
+            "地点": "地点", "上课地点": "地点",
+            "学生人数": "学生人数", "人数": "学生人数",
+            "课程类型": "课程类型", "学生姓名": "学生姓名", "学生": "学生姓名", "姓名": "学生姓名",
+            "学科": "学科", "科目": "学科", "年级": "年级", "任课老师": "任课老师", "老师": "任课老师",
+        }
+        header_map = {}
+        for index, header in enumerate(header_row):
+            key = str(header or "").strip().replace(" ", "")
+            if key in aliases:
+                header_map[aliases[key]] = index
+
+        required = ("日期", "开始时间", "结束时间", "学生姓名", "学科", "年级")
+        missing = [name for name in required if name not in header_map]
+        if missing:
+            raise ValueError("Excel 缺少必要列：" + "、".join(missing) + "。请使用软件导出的课程记录表作为模板。")
+
+        imported = []
+        errors = []
+        for excel_row, cells in enumerate(values, start=2):
+            if not cells or all(cell is None or str(cell).strip() == "" for cell in cells):
+                continue
+            raw = {name: (cells[index] if index < len(cells) else None) for name, index in header_map.items()}
+            try:
+                row = {name: "" for name in COLUMNS}
+                row["日期"] = _excel_date(raw.get("日期"))
+                row["开始时间"] = _excel_time(raw.get("开始时间"))
+                row["结束时间"] = _excel_time(raw.get("结束时间"))
+                row["学生姓名"] = str(raw.get("学生姓名") or "").strip()
+                row["学科"] = str(raw.get("学科") or "").strip()
+                row["年级"] = str(raw.get("年级") or "").strip()
+                row["地点"] = str(raw.get("地点") or "").strip()
+                row["任课老师"] = str(raw.get("任课老师") or "").strip()
+                if not row["学生姓名"] or not row["学科"] or not row["年级"]:
+                    raise ValueError("学生姓名、学科、年级不能为空")
+                count_value = raw.get("学生人数")
+                row["学生人数"] = max(1, int(float(count_value))) if count_value not in (None, "") else max(1, len([x for x in row["学生姓名"].replace("，", "、").split("、") if x.strip()]))
+                row["课程类型"] = str(raw.get("课程类型") or ("一对一" if row["学生人数"] == 1 else "班课")).strip()
+                for field in ("正常课时", "三倍课时", "总课时"):
+                    value = raw.get(field)
+                    row[field] = float(value) if value not in (None, "") else ""
+                # Validate chronological order before returning any data.
+                start_dt = datetime.strptime(row["日期"] + " " + row["开始时间"], "%Y-%m-%d %H:%M")
+                end_dt = datetime.strptime(row["日期"] + " " + row["结束时间"], "%Y-%m-%d %H:%M")
+                if end_dt <= start_dt:
+                    raise ValueError("结束时间必须晚于开始时间")
+                imported.append(row)
+            except Exception as exc:
+                errors.append(f"第 {excel_row} 行：{exc}")
+        if errors:
+            shown = "\n".join(errors[:12])
+            suffix = f"\n另有 {len(errors)-12} 条错误未显示。" if len(errors) > 12 else ""
+            raise ValueError(f"Excel 中有 {len(errors)} 行数据不符合要求，未导入任何记录：\n{shown}{suffix}")
+        if not imported:
+            raise ValueError("没有找到可导入的课程记录。")
+        return imported
+    finally:
+        workbook.close()

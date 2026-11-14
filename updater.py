@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.2"
 GITHUB_OWNER = "WuXian-1023"
 GITHUB_REPO = "course-manager"
 RELEASES_API = (

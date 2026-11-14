@@ -1,0 +1,37 @@
+# Python 缓存
+__pycache__/
+*.py[cod]
+
+# 虚拟环境
+.venv/
+venv/
+
+# Android / Windows 构建产物
+.buildozer/
+build/
+dist/
+bin/
+*.apk
+*.exe
+
+# 日志和临时文件
+*.log
+*.tmp
+*:Zone.Identifier
+
+# 本地数据库和备份
+*.sqlite
+*.sqlite3
+*.sqlite*
+*.db
+backups/
+backup/
+
+# 签名密钥及密码
+*.jks
+*.keystore
+password
+
+# 系统文件
+.DS_Store
+Thumbs.db

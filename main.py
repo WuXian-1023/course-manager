@@ -2,6 +2,7 @@
 """Kivy Android course manager. Offline-first; business rules ported from the supplied PySide6 source."""
 from datetime import date, datetime, time, timedelta
 import os, calendar, sqlite3, json, uuid, threading, webbrowser
+from io import BytesIO
 from pathlib import Path
 
 from kivy.app import App
@@ -28,7 +29,7 @@ from updater import APP_VERSION, check_github_release, is_newer_version
 # 中文字体：优先使用项目内字体，保证 WSL 与 Android 打包后显示一致。
 BASE_DIR = Path(__file__).resolve().parent
 CHINESE_FONT_PATH = BASE_DIR / "fonts" / "NotoSansCJK-Regular.ttc"
-TITLE_FONT_PATH = BASE_DIR / "fonts" / "title.ttf"
+TITLE_FONT_PATH = BASE_DIR / "assets" / "title.ttf"
 if TITLE_FONT_PATH.exists():
     LabelBase.register(name="TitleFont", fn_regular=str(TITLE_FONT_PATH))
 else:
@@ -250,6 +251,16 @@ class WheelColumn(ScrollView):
         )
         self.values = list(values)
         self.row_height = dp(48)
+                # 时间滚轮浅蓝白色背景
+        with self.canvas.before:
+            Color(0.94, 0.97, 1.00, 1)
+            self.wheel_bg = RoundedRectangle(
+                pos=self.pos,
+                size=self.size,
+                radius=[dp(12)]
+            )
+
+        self.bind(pos=self._sync_wheel_bg, size=self._sync_wheel_bg)
         self.selected_index = 0
 
         self.grid = GridLayout(
@@ -281,6 +292,11 @@ class WheelColumn(ScrollView):
         Clock.schedule_once(
             lambda dt: self.set_selected(selected), 0.2
         )
+
+    def _sync_wheel_bg(self, *_):
+        self.wheel_bg.pos = self.pos
+        self.wheel_bg.size = self.size
+
 
     def set_selected(self, value):
         try:
@@ -466,6 +482,15 @@ class CourseApp(App):
         self.templates_path = os.path.join(app_data_dir(), "CourseTemplate.json")
         self.holidays_path = os.path.join(app_data_dir(), "holidays.json")
         self.templates = self.load_templates()
+
+        # Android 使用系统文件选择器读取用户主动选择的 Excel 文件（无需广泛存储权限）。
+        self._excel_picker_request_code = 7312
+        if platform == "android":
+            try:
+                from android import activity
+                activity.bind(on_activity_result=self._on_android_activity_result)
+            except Exception as exc:
+                print(f"Excel 文件选择器初始化失败：{exc}")
 
         # 节假日配置保存在应用私有目录，不随程序更新覆盖。
         try:
@@ -967,36 +992,29 @@ class CourseApp(App):
             spacing=dp(8)
         )
 
+        # 左右使用等宽占位，确保返回按钮不会把标题挤偏。
+        side_width = dp(48)
         if name != "home":
             back = Button(
-                text="‹",
-                font_name="ChineseFont",
-                font_size="28sp",
-                size_hint_x=None,
-                width=dp(48),
-                background_normal="",
-                background_color=COLORS["primary_light"],
+                text="‹", font_name="ChineseFont", font_size="28sp",
+                size_hint=(None, 1), width=side_width,
+                background_normal="", background_color=COLORS["primary_light"],
                 color=COLORS["primary_dark"]
             )
             back.bind(on_release=lambda *_: self.go("home"))
             header.add_widget(back)
-        # 首页标题占满整行并居中；其他页面保留左侧返回按钮布局。
         else:
-            pass
+            header.add_widget(Widget(size_hint_x=None, width=side_width))
 
-        header.add_widget(Label(
+        title_label = Label(
             text=title,
             font_name="TitleFont" if TITLE_FONT_PATH else "ChineseFont",
-            font_size="21sp",
-            bold=True,
-            color=COLORS["text"],
-            halign="center" if name == "home" else "left",
-            valign="middle"
-        ))
-
-        if name != "home":
-            header.add_widget(Widget())
-
+            font_size="21sp", bold=True, color=COLORS["text"],
+            halign="center", valign="middle", size_hint_x=1
+        )
+        title_label.bind(size=lambda widget, size: setattr(widget, "text_size", (size[0], None)))
+        header.add_widget(title_label)
+        header.add_widget(Widget(size_hint_x=None, width=side_width))
         root.add_widget(header)
 
         if name == "home":
@@ -1017,12 +1035,29 @@ class CourseApp(App):
         sv = ScrollView(
             do_scroll_x=False,
             bar_width=dp(3),
-            scroll_type=["content", "bars"]
+            scroll_type=["content", "bars"],
+            bar_color=(0.35, 0.65, 0.85, 0.65),
+            bar_inactive_color=(0.65, 0.78, 0.88, 0.25)
         )
+
+        # 滚动区域使用浅蓝白色背景
+        with sv.canvas.before:
+            Color(0.94, 0.97, 1.00, 1)
+            sv_bg = RoundedRectangle(
+                pos=sv.pos,
+                size=sv.size,
+                radius=[dp(12)]
+            )
+
+        def sync_scroll_bg(*_):
+            sv_bg.pos = sv.pos
+            sv_bg.size = sv.size
+
+        sv.bind(pos=sync_scroll_bg, size=sync_scroll_bg)
+
         sv.add_widget(content)
         root.add_widget(sv)
         root.add_widget(self.bottom_nav())
-
         return root
 
     def column(self, spacing=dp(8)):
@@ -1106,22 +1141,84 @@ class CourseApp(App):
         elif name == "calendar": self.refresh_calendar()
         elif name == "templates": self.refresh_templates()
 
+
     def notice(self, title, message):
+        """根据提示类型显示蓝白薄荷绿风格弹窗。"""
+
+        title_text = str(title)
+
+        # 按提示内容识别弹窗类型
+        if any(word in title_text for word in (
+            "失败", "错误", "无法", "异常"
+        )):
+            tone = "error"
+        elif any(word in title_text for word in (
+            "成功", "完成", "已保存", "已更新", "导入完成",
+            "导出成功", "备份成功", "恢复完成", "统计完成"
+        )):
+            tone = "success"
+        elif any(word in title_text for word in (
+            "警告", "确认", "删除", "恢复", "注意"
+        )):
+            tone = "warning"
+        else:
+            tone = "info"
+
+        palette = {
+            "info": {
+                "background": (0.92, 0.96, 1.00, 1),
+                "separator": (0.40, 0.65, 0.88, 1),
+                "button": (0.25, 0.48, 0.78, 1),
+            },
+            "success": {
+                "background": (0.90, 0.97, 0.93, 1),
+                "separator": (0.40, 0.72, 0.59, 1),
+                "button": (0.20, 0.62, 0.48, 1),
+            },
+            "warning": {
+                "background": (1.00, 0.97, 0.88, 1),
+                "separator": (0.88, 0.70, 0.34, 1),
+                "button": (0.76, 0.57, 0.20, 1),
+            },
+            "error": {
+                "background": (1.00, 0.93, 0.93, 1),
+                "separator": (0.85, 0.52, 0.52, 1),
+                "button": (0.78, 0.30, 0.32, 1),
+            },
+        }
+
+        colors = palette[tone]
+
         box = BoxLayout(
             orientation="vertical",
             padding=dp(16),
             spacing=dp(12)
         )
 
+        # 弹窗内容区域背景
+        with box.canvas.before:
+            Color(*colors["background"])
+            bg_rect = RoundedRectangle(
+                pos=box.pos,
+                size=box.size,
+                radius=[dp(12)]
+            )
+
+        def sync_box_bg(*_):
+            bg_rect.pos = box.pos
+            bg_rect.size = box.size
+
+        box.bind(pos=sync_box_bg, size=sync_box_bg)
+
         box.add_widget(AutoLabel(
-            text=message,
+            text=str(message),
             font_name="ChineseFont",
             font_size="14sp",
             color=COLORS["text"],
             halign="left",
             valign="middle",
             size_hint_y=None,
-            height=dp(80)
+            height=dp(100)
         ))
 
         btn = Button(
@@ -1131,24 +1228,29 @@ class CourseApp(App):
             size_hint_y=None,
             height=dp(44),
             background_normal="",
-            background_color=COLORS["primary"],
+            background_down="",
+            background_color=colors["button"],
             color=(1, 1, 1, 1)
         )
 
         box.add_widget(btn)
 
         pop = Popup(
-            title=title,
+            title=title_text,
             title_font="ChineseFont",
             title_size="16sp",
+            title_color=COLORS["text"],
             content=box,
             size_hint=(0.88, None),
-            height=dp(230),
-            separator_color=COLORS["primary"]
+            height=dp(250),
+            auto_dismiss=False,
+            background_color=colors["background"],
+            separator_color=colors["separator"]
         )
 
         btn.bind(on_release=pop.dismiss)
         pop.open()
+
 
     def home_content(self):
         c = self.column(dp(14))
@@ -1386,7 +1488,7 @@ class CourseApp(App):
         return c
 
     def section_title(self, text):
-        return Label(
+        title = Label(
             text=text,
             font_name="TitleFont" if TITLE_FONT_PATH else "ChineseFont",
             font_size="16sp",
@@ -1394,9 +1496,11 @@ class CourseApp(App):
             size_hint_y=None,
             height=dp(36),
             color=COLORS["primary_dark"],
-            halign="left",
+            halign="center",
             valign="middle"
         )
+        title.bind(size=lambda widget, size: setattr(widget, "text_size", size))
+        return title
 
     def add_content(self):
         c = self.column(dp(6))
@@ -1408,6 +1512,20 @@ class CourseApp(App):
             date.today().isoformat(),
             self.open_date_picker
         )
+
+        self._course_template_map = {}
+        template_labels = ["不使用模板"]
+        for template in self.templates.get("weekly_templates", []):
+            base = f"{template.get('student', '未命名学生')} · {template.get('subject', '未设置学科')} · {template.get('weekday', '')} {template.get('start', '')}".strip()
+            label = base
+            suffix = 2
+            while label in self._course_template_map:
+                label = f"{base} ({suffix})"
+                suffix += 1
+            self._course_template_map[label] = template
+            template_labels.append(label)
+        self.f_template = SelectField("选择学生模板（自动填入课程信息）", template_labels, "不使用模板")
+        self.f_template.input.bind(text=self.on_course_template_selected)
 
         self.f_start = TimeField(
             "开始时间",
@@ -1500,6 +1618,7 @@ class CourseApp(App):
         # 再添加到页面
         c.add_widget(self.section_title("上课信息"))
         c.add_widget(self.f_date)
+        c.add_widget(self.f_template)
         c.add_widget(self.f_start)
         c.add_widget(self.f_end)
         c.add_widget(self.f_location)
@@ -1561,6 +1680,27 @@ class CourseApp(App):
 
         return c
 
+    def on_course_template_selected(self, spinner, selected):
+        """Apply a saved student template without changing the course date."""
+        template = self._course_template_map.get(selected)
+        if not template:
+            return
+        names = [part.strip() for part in str(template.get("student", "")).replace("，", "、").replace(",", "、").split("、") if part.strip()]
+        count = max(1, int(template.get("student_count", len(names) or 1) or 1))
+        self.f_count.input.text = str(count)
+        self.f_names.set_count(count, names)
+        self.f_subject.input.text = template.get("subject", self.f_subject.text)
+        self.f_grade.input.text = template.get("grade", self.f_grade.text)
+        self.f_teacher.input.text = "、".join(template.get("teachers", [])) if isinstance(template.get("teachers", []), list) else str(template.get("teachers", ""))
+        self.f_start.input.text = template.get("start", self.f_start.text)
+        self.f_end.input.text = template.get("end", self.f_end.text)
+        self.f_location.input.text = template.get("location", self.f_location.text)
+        # Date intentionally remains unchanged and can still be edited above.
+        self.f_normal.input.text = ""
+        self.f_triple.input.text = ""
+        self.f_total.input.text = ""
+        self.notice("已套用学生模板", "学生、年级、学科、地点、老师和上课时间已填入；日期保持原样，你仍可修改任何细节。")
+
     def on_student_count_change(self, instance, value):
         try:
             count = max(1, min(50, int(value or "1")))
@@ -1605,7 +1745,7 @@ class CourseApp(App):
             old_hour, old_minute = 16, 0
 
         hours = [f"{i:02d}" for i in range(24)]
-        minutes = [f"{i:02d}" for i in range(0, 60, 5)]
+        minutes = [f"{i:02d}" for i in range(60)]
 
         current_minute = min(
             minutes,
@@ -1982,12 +2122,16 @@ class CourseApp(App):
 
     def templates_content(self):
         c=self.column(dp(6));c.padding=dp(6)
-        self.t_student=Field("学生姓名");self.t_grade=SelectField("年级",GRADES,"8年级")
+        self.t_student=Field("学生姓名（多人用顿号分隔）")
+        self.t_count=Field("学生人数", "1")
+        self.t_grade=SelectField("年级",GRADES,"8年级")
+        self.t_location=SelectField("上课地点",LOCATIONS,LOCATIONS[0])
         self.t_teachers=Field("任课老师（多个用顿号分隔）")
         self.t_weekday=SelectField("每周星期",WEEKDAYS,"周一")
-        self.t_start=Field("开始时间","16:00");self.t_end=Field("结束时间","17:00")
+        self.t_start=TimeField("开始时间","16:00",self.open_time_picker)
+        self.t_end=TimeField("结束时间","17:00",self.open_time_picker)
         self.t_subject=SelectField("学科",SUBJECTS,"数学")
-        self.template_fields=[self.t_student,self.t_grade,self.t_teachers,self.t_weekday,self.t_start,self.t_end,self.t_subject]
+        self.template_fields=[self.t_student,self.t_count,self.t_grade,self.t_location,self.t_teachers,self.t_weekday,self.t_start,self.t_end,self.t_subject]
         for f in self.template_fields:c.add_widget(f)
         c.add_widget(self.button("保存 / 更新模板",self.save_template))
         c.add_widget(self.button("清空模板表单",self.clear_template_form))
@@ -2018,6 +2162,24 @@ class CourseApp(App):
             except OSError:
                 pass
             raise
+    def refresh_course_template_options(self):
+        if not hasattr(self, "f_template"):
+            return
+        self._course_template_map = {}
+        labels = ["不使用模板"]
+        for template in self.templates.get("weekly_templates", []):
+            base = f"{template.get('student', '未命名学生')} · {template.get('subject', '未设置学科')} · {template.get('weekday', '')} {template.get('start', '')}".strip()
+            label = base
+            suffix = 2
+            while label in self._course_template_map:
+                label = f"{base} ({suffix})"
+                suffix += 1
+            self._course_template_map[label] = template
+            labels.append(label)
+        self.f_template.input.values = labels
+        if self.f_template.text not in labels:
+            self.f_template.input.text = labels[0]
+
     def refresh_templates(self):
         if not hasattr(self,"template_box"):return
         self.template_box.clear_widgets()
@@ -2025,19 +2187,43 @@ class CourseApp(App):
             self.template_box.add_widget(self.button(f"{t['student']} | {t['grade']} | {t['weekday']} {t['start']}-{t['end']} | {t['subject']} | {'、'.join(t.get('teachers',[]))}",lambda x=t:self.select_template(x),56))
             self.template_box.add_widget(self.button("删除此模板",lambda x=t:self.delete_template(x["id"]),36))
         if not self.template_box.children:self.template_box.add_widget(self.label("暂无模板",36))
+        self.refresh_course_template_options()
+
     def save_template(self):
         if not self.t_student.text:self.notice("提示","请填写学生姓名");return
+        try:
+            student_count=max(1,int(self.t_count.text or "1"))
+        except ValueError:
+            self.notice("提示","学生人数必须是正整数");return
         teachers=[x.strip() for x in self.t_teachers.text.replace("，","、").replace(",","、").split("、") if x.strip()]
-        t={"id":str(uuid.uuid4()),"student":self.t_student.text,"grade":self.t_grade.text,"teachers":teachers,"weekday":self.t_weekday.text,"start":self.t_start.text,"end":self.t_end.text,"subject":self.t_subject.text}
+        t={"id":str(uuid.uuid4()),"student":self.t_student.text,"student_count":student_count,"grade":self.t_grade.text,"location":self.t_location.text,"teachers":teachers,"weekday":self.t_weekday.text,"start":self.t_start.text,"end":self.t_end.text,"subject":self.t_subject.text}
         existing=next((x for x in self.templates["weekly_templates"] if x["student"]==t["student"] and x["subject"]==t["subject"] and x["weekday"]==t["weekday"]),None)
         if existing: t["id"]=existing["id"];self.templates["weekly_templates"].remove(existing)
-        self.templates["weekly_templates"].append(t);self.persist_templates();self.refresh_templates();self.notice("模板已保存","已保存或更新该学生的每周课程模板。")
+        self.templates["weekly_templates"].append(t);self.persist_templates();self.refresh_templates();self.notice("模板已保存","已保存或更新该学生的课程模板。录入课程时可直接选择。")
+
     def select_template(self,t):
-        self.t_student.input.text=t["student"];self.t_grade.input.text=t["grade"];self.t_teachers.input.text="、".join(t.get("teachers",[]));self.t_weekday.input.text=t["weekday"];self.t_start.input.text=t["start"];self.t_end.input.text=t["end"];self.t_subject.input.text=t["subject"]
+        self.t_student.input.text=t["student"]
+        self.t_count.input.text=str(t.get("student_count", 1))
+        self.t_grade.input.text=t["grade"]
+        self.t_location.input.text=t.get("location", LOCATIONS[0])
+        self.t_teachers.input.text="、".join(t.get("teachers",[])) if isinstance(t.get("teachers",[]), list) else str(t.get("teachers", ""))
+        self.t_weekday.input.text=t["weekday"]
+        self.t_start.input.text=t["start"]
+        self.t_end.input.text=t["end"]
+        self.t_subject.input.text=t["subject"]
+
     def delete_template(self,tid):
         self.templates["weekly_templates"]=[x for x in self.templates["weekly_templates"] if x["id"]!=tid];self.persist_templates();self.refresh_templates()
+
     def clear_template_form(self):
-        self.t_student.input.text="";self.t_teachers.input.text="";self.t_start.input.text="16:00";self.t_end.input.text="17:00"
+        self.t_student.input.text=""
+        self.t_count.input.text="1"
+        self.t_grade.input.text="8年级"
+        self.t_location.input.text=LOCATIONS[0]
+        self.t_teachers.input.text=""
+        self.t_start.input.text="16:00"
+        self.t_end.input.text="17:00"
+        self.t_subject.input.text="数学"
 
     def salary_content(self):
         c=self.column(dp(8));c.padding=dp(6)
@@ -2065,6 +2251,8 @@ class CourseApp(App):
         c=self.column(dp(10));c.padding=dp(8)
         c.add_widget(self.label("Excel 文件会保存在应用本地目录。可通过 Android 文件管理器的应用文件访问方式取出；具体路径因 Android 版本而异。",100))
         c.add_widget(self.button("导出全部课程记录 Excel",self.export_records,54))
+        c.add_widget(self.button("从 Excel 导入课程记录",self.choose_excel_import,54,"green"))
+        c.add_widget(self.label("Excel 导入采用追加方式，不覆盖已有课程；完全相同的记录会自动跳过。",54,COLORS["text_secondary"],"12sp"))
         c.add_widget(self.button("生成本地 JSON 备份",self.backup_json,54))
         c.add_widget(self.button("从 JSON 备份恢复",self.restore_json,54))
         c.add_widget(self.section_title("软件更新"))
@@ -2158,6 +2346,274 @@ class CourseApp(App):
                 webbrowser.open(url)
         except Exception as exc:
             self.notice("无法打开下载页面", f"请复制并在浏览器中打开：\n{url}\n\n错误：{exc}")
+
+    def choose_excel_import(self):
+        """Open Android document picker and import the selected .xlsx after preview."""
+        if platform == "android":
+            try:
+                from jnius import autoclass
+                PythonActivity = autoclass("org.kivy.android.PythonActivity")
+                Intent = autoclass("android.content.Intent")
+                intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                # Some Android document providers do not filter correctly for the
+                # XLSX MIME type. Let the user choose a file, then validate it with
+                # openpyxl and show a clear error if it is not a supported workbook.
+                intent.setType("*/*")
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                print("[ExcelImport] Launching Android document picker")
+                PythonActivity.mActivity.startActivityForResult(
+                    intent, self._excel_picker_request_code
+                )
+            except Exception as exc:
+                print(f"[ExcelImport] Cannot launch picker: {exc}")
+                self.notice("无法打开文件选择器", str(exc))
+            return
+
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                root.attributes("-topmost", True)
+                path = filedialog.askopenfilename(
+                    title="选择课程记录 Excel 文件",
+                    filetypes=[("Excel 工作簿", "*.xlsx")]
+                )
+            finally:
+                root.destroy()
+            if path:
+                self._load_excel_path(path)
+        except Exception as exc:
+            self.notice("无法选择 Excel 文件", f"请确认桌面环境可用，然后重试。\n{exc}")
+
+    def _on_android_activity_result(self, request_code, result_code, intent):
+        """Receive the document URI, then process it on Kivy's UI thread."""
+        try:
+            request_code = int(request_code)
+        except Exception:
+            pass
+        if request_code != self._excel_picker_request_code:
+            return
+
+        print(f"[ExcelImport] Activity result: request={request_code}, result={result_code}")
+        if int(result_code) != -1:  # Activity.RESULT_OK
+            print("[ExcelImport] User cancelled document picker")
+            return
+        if intent is None:
+            Clock.schedule_once(
+                lambda _dt: self.notice("Excel 文件读取失败", "系统没有返回所选文件信息，请重新选择。"), 0
+            )
+            return
+
+        try:
+            uri = intent.getData()
+            if uri is None:
+                raise ValueError("系统没有返回文件 URI，请从文件管理器重新选择 .xlsx 文件。")
+            # UI widgets must be updated on Kivy's main thread. Keep the Java URI
+            # alive in the scheduled callback rather than parsing inside the
+            # Android activity-result callback.
+            Clock.schedule_once(lambda _dt, selected_uri=uri: self._read_android_excel_uri(selected_uri), 0)
+        except Exception as exc:
+            print(f"[ExcelImport] Failed to receive URI: {exc}")
+            Clock.schedule_once(lambda _dt, error=str(exc): self.notice("Excel 文件读取失败", error), 0)
+
+    def _read_android_excel_uri(self, uri):
+        """Read a content:// URI using ContentResolver without filesystem paths."""
+        stream = None
+        try:
+            from jnius import autoclass
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            resolver = PythonActivity.mActivity.getContentResolver()
+            stream = resolver.openInputStream(uri)
+            if stream is None:
+                raise IOError("Android 无法打开该文件。请确认文件可访问，或先保存到手机本地。")
+
+            # Read byte-by-byte. This avoids Pyjnius byte[] overload/conversion
+            # differences seen across Android versions and document providers.
+            raw = bytearray()
+            while True:
+                value = stream.read()
+                if value == -1:
+                    break
+                raw.append(value & 0xFF)
+            if not raw:
+                raise ValueError("所选文件为空。")
+            print(f"[ExcelImport] Read {len(raw)} bytes from selected document")
+            self._load_excel_bytes(bytes(raw))
+        except Exception as exc:
+            print(f"[ExcelImport] Read/parse failed: {exc}")
+            self.notice("Excel 文件读取失败", f"{exc}\n\n请确认选择的是 .xlsx 格式文件。")
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+    def _load_excel_path(self, path):
+        try:
+            from exporter import import_records
+            rows = import_records(path)
+            self._preview_excel_import(rows)
+        except Exception as exc:
+            self.notice("Excel 导入检查失败", str(exc))
+
+    def _load_excel_bytes(self, raw):
+        try:
+            from exporter import import_records
+            rows = import_records(BytesIO(raw))
+            self._preview_excel_import(rows)
+        except Exception as exc:
+            self.notice("Excel 导入检查失败", str(exc))
+
+    def _preview_excel_import(self, rows):
+        """Show a high-contrast, scrollable preview before importing records."""
+        self._pending_excel_rows = rows
+
+        # Use explicit light surfaces and dark text: Android Popup theme colors
+        # can otherwise make preview text look washed out on some devices.
+        root = BoxLayout(
+            orientation="vertical",
+            padding=(dp(14), dp(12), dp(14), dp(12)),
+            spacing=dp(10)
+        )
+        root_bg = (0.97, 0.985, 1.0, 1)
+        with root.canvas.before:
+            Color(*root_bg)
+            root_rect = RoundedRectangle(pos=root.pos, size=root.size, radius=[dp(14)])
+        def sync_root_bg(*_):
+            root_rect.pos = root.pos
+            root_rect.size = root.size
+        root.bind(pos=sync_root_bg, size=sync_root_bg)
+
+        summary = Label(
+            text=f"已读取 {len(rows)} 条课程记录",
+            font_name="ChineseFont",
+            font_size="17sp",
+            bold=True,
+            color=(0.06, 0.22, 0.43, 1),
+            size_hint_y=None,
+            height=dp(34),
+            halign="left",
+            valign="middle"
+        )
+        summary.bind(size=lambda w, *_: setattr(w, "text_size", w.size))
+        root.add_widget(summary)
+
+        preview_lines = []
+        for index, row in enumerate(rows[:8], 1):
+            preview_lines.append(
+                f"{index}. {row.get('日期', '')}  "
+                f"{row.get('开始时间', '')}-{row.get('结束时间', '')}\n"
+                f"   {row.get('学生姓名', '')}  |  {row.get('学科', '')}  |  {row.get('年级', '')}"
+            )
+        if len(rows) > 8:
+            preview_lines.append(f"\n……其余 {len(rows) - 8} 条记录将在确认后一起导入")
+        if not rows:
+            preview_lines.append("没有读取到课程记录，请检查 Excel 工作表和内容。")
+
+        scroll = ScrollView(do_scroll_x=False, bar_width=dp(5))
+        preview_card = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            padding=(dp(12), dp(12)),
+            spacing=dp(8)
+        )
+        preview_card.bind(minimum_height=preview_card.setter("height"))
+        with preview_card.canvas.before:
+            Color(1, 1, 1, 1)
+            card_rect = RoundedRectangle(pos=preview_card.pos, size=preview_card.size, radius=[dp(10)])
+        def sync_card_bg(*_):
+            card_rect.pos = preview_card.pos
+            card_rect.size = preview_card.size
+        preview_card.bind(pos=sync_card_bg, size=sync_card_bg)
+
+        detail = AutoLabel(
+            text="\n\n".join(preview_lines),
+            font_name="ChineseFont",
+            font_size="14sp",
+            color=(0.10, 0.14, 0.21, 1),
+            halign="left",
+            valign="top",
+            size_hint_y=None,
+            padding=(dp(2), dp(4))
+        )
+        detail.bind(width=lambda w, *_: setattr(w, "text_size", (w.width, None)))
+        detail.bind(texture_size=lambda w, size: setattr(w, "height", size[1] + dp(8)))
+        preview_card.add_widget(detail)
+        scroll.add_widget(preview_card)
+        root.add_widget(scroll)
+
+        tip = Label(
+            text="确认后将追加到现有课程记录，不会删除或覆盖已有数据；重复记录会自动跳过。",
+            font_name="ChineseFont",
+            font_size="12sp",
+            color=(0.25, 0.32, 0.42, 1),
+            size_hint_y=None,
+            height=dp(42),
+            halign="left",
+            valign="middle"
+        )
+        tip.bind(size=lambda w, *_: setattr(w, "text_size", w.size))
+        root.add_widget(tip)
+
+        actions = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(10))
+        popup = Popup(
+            title="导入课程记录",
+            title_font="ChineseFont",
+            title_size="17sp",
+            title_color=(0.06, 0.18, 0.34, 1),
+            content=root,
+            size_hint=(.93, .78),
+            auto_dismiss=False,
+            background="atlas://data/images/defaulttheme/modal",
+            background_color=(1, 1, 1, 1),
+            separator_color=(0.78, 0.84, 0.92, 1)
+        )
+        cancel = Button(
+            text="取消", font_name="ChineseFont", font_size="14sp",
+            background_normal="", background_down="",
+            background_color=(0.90, 0.93, 0.97, 1),
+            color=(0.12, 0.20, 0.32, 1)
+        )
+        confirm = Button(
+            text="确认导入", font_name="ChineseFont", font_size="14sp",
+            background_normal="", background_down="",
+            background_color=(0.08, 0.43, 0.32, 1),
+            color=(1, 1, 1, 1)
+        )
+        cancel.bind(on_release=lambda *_: popup.dismiss())
+        confirm.disabled = not bool(rows)
+        confirm.bind(on_release=lambda *_: self._confirm_excel_import(popup))
+        actions.add_widget(cancel)
+        actions.add_widget(confirm)
+        root.add_widget(actions)
+        popup.open()
+
+    def _confirm_excel_import(self, popup):
+        try:
+            rows = getattr(self, "_pending_excel_rows", [])
+            # Fill missing lesson-hour values using the same calculation rules as manual entry.
+            prepared = []
+            for source in rows:
+                row = dict(source)
+                calculated = calculate_one_record(row)
+                for key in ("正常课时", "三倍课时", "总课时"):
+                    if row.get(key) in (None, ""):
+                        row[key] = calculated[key]
+                prepared.append(row)
+            inserted, skipped = self.db.add_records_bulk(prepared)
+            self._pending_excel_rows = []
+            popup.dismiss()
+            self.notice("导入完成", f"新增 {inserted} 条课程记录。\n跳过重复记录 {skipped} 条。\n原有记录未被覆盖。")
+            if self.sm.current == "records":
+                self.refresh_records()
+            elif self.sm.current == "calendar":
+                self.refresh_calendar()
+        except Exception as exc:
+            self.notice("导入失败", str(exc))
 
     def export_records(self):
         try:

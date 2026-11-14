@@ -176,6 +176,52 @@ class Database:
     # 数据库完整性检查
     # -------------------------------------------------
 
+    def add_records_bulk(self, rows):
+        """Append imported records in one transaction; never replaces existing data."""
+        if not rows:
+            return 0, 0
+
+        numeric_columns = {"正常课时", "三倍课时", "总课时", "学生人数"}
+
+        def value_key(value, column):
+            if value is None or value == "":
+                return ""
+            if column in numeric_columns:
+                try:
+                    number = float(value)
+                    return str(int(number)) if number.is_integer() else f"{number:.6f}".rstrip("0").rstrip(".")
+                except (TypeError, ValueError):
+                    pass
+            return str(value).strip()
+
+        columns_sql = ",".join('"' + name + '"' for name in COLUMNS)
+        placeholders = ",".join("?" for _ in COLUMNS)
+        inserted = skipped = 0
+        with self.connect() as connection:
+            existing_rows = connection.execute(
+                f"SELECT {columns_sql} FROM records"
+            ).fetchall()
+            existing = {
+                tuple(value_key(row[index], column) for index, column in enumerate(COLUMNS))
+                for row in existing_rows
+            }
+            batch = []
+            for row in rows:
+                values = [row.get(column, "") for column in COLUMNS]
+                key = tuple(value_key(value, column) for value, column in zip(values, COLUMNS))
+                if key in existing:
+                    skipped += 1
+                    continue
+                existing.add(key)
+                batch.append(values)
+            if batch:
+                connection.executemany(
+                    f"INSERT INTO records({columns_sql}) VALUES({placeholders})",
+                    batch
+                )
+                inserted = len(batch)
+        return inserted, skipped
+
     def integrity_check(self):
 
         with self.connect() as conn:
