@@ -782,12 +782,13 @@ class CourseApp(App):
             nav_border.rounded_rectangle = (nav.x, nav.y, nav.width, nav.height, dp(12))
         nav.bind(pos=sync_nav, size=sync_nav)
 
+        # 底部常驻入口与高频操作保持一致；模板、导出与备份从首页常用功能进入。
         items = [
             ("首页", "home"),
             ("录入", "add"),
             ("记录", "records"),
             ("日历", "calendar"),
-            ("更多", "export"),
+            ("工资", "salary"),
         ]
 
         for title, target in items:
@@ -992,11 +993,11 @@ class CourseApp(App):
             spacing=dp(8)
         )
 
-        # 左右使用等宽占位，确保返回按钮不会把标题挤偏。
-        side_width = dp(48)
+        # 左右使用等宽区域，保证“返回首页”按钮不会把标题挤偏。
+        side_width = dp(104)
         if name != "home":
             back = Button(
-                text="‹", font_name="ChineseFont", font_size="28sp",
+                text="‹ 返回首页", font_name="ChineseFont", font_size="14sp",
                 size_hint=(None, 1), width=side_width,
                 background_normal="", background_color=COLORS["primary_light"],
                 color=COLORS["primary_dark"]
@@ -2229,22 +2230,42 @@ class CourseApp(App):
         c=self.column(dp(8));c.padding=dp(6)
         self.sal_year=Field("年份",str(date.today().year));self.sal_month=Field("月份",str(date.today().month))
         for f in (self.sal_year,self.sal_month):c.add_widget(f)
+        c.add_widget(self.label("加班明细自动读取课程记录中的‘三倍课时’。三倍课时大于0即视为加班，无需单独录入。",76))
         c.add_widget(self.button("计算工资并导出工资明细",self.calculate_salary,54))
-        self.salary_result=self.label("尚未计算工资",160);c.add_widget(self.salary_result)
+        self.salary_result=self.label("尚未计算工资",420);c.add_widget(self.salary_result)
         c.add_widget(self.label("固定工资参数沿用原代码：基本工资2000、晚托1000、全勤100、教师资格证补贴400。",72))
         return c
+
     def calculate_salary(self):
         try:
             year=int(self.sal_year.text);month=int(self.sal_month.text)
-            rows=self.db.get_month_records(year,month)
-            if not rows:self.notice("工资统计","该月没有课程记录");return
+            # 传入全部历史记录，才能正确计算跨月自然周的信息费首次归属。
+            rows=self.db.get_records()
+            month_rows=[r for r in rows if parse_date(r["日期"]).year==year and parse_date(r["日期"]).month==month]
+            if not month_rows:self.notice("工资统计","该月没有课程记录");return
             result=salary_for_month(rows,year,month)
             from exporter import export_salary
             path=os.path.join(app_data_dir(),f"{year}年{month}月工资统计.xlsx")
             path = export_salary(path,result)
-            self.salary_result.text=(f"{year}年{month}月工资统计\n固定工资：{result['fixed_salary']:.2f}元\n课时工资：{result['lesson_salary']:.2f}元\n"
-                                     f"本月工资：{result['total_salary']:.2f}元\n\n"+"\n".join(f"{k}：{v:.2f}元" for k,v in result["summary"].items())+f"\n\n已保存：{path}")
-            self.notice("统计完成",f"本月工资：{result['total_salary']:.2f}元\nExcel已保存到应用本地目录。")
+            location_text="\n".join(
+                f"{name}：课时 {v['总课时']:.2f}，课时费 {v['课时费']:.2f}元，信息费 {v['学生信息费']:.2f}元，校区合计 {v['校区合计']:.2f}元"
+                for name,v in result["location_totals"].items()
+            ) or "暂无校区统计"
+            overtime_detail="\n".join(
+                f"{r['学生姓名']}：{r['日期']} {r['开始时间']}-{r['结束时间']}，实际加班{r['实际加班课时']:g}课时，三倍折算{r['三倍折算课时']:g}课时，额外增加{r['额外增加课时']:g}课时，增加工资{r['加班增加工资']:.2f}元"
+                for r in result.get("overtime_rows", [])) or "本月无加班记录"
+            self.salary_result.text=(f"{year}年{month}月工资统计\n"
+                                     f"固定工资：{result['fixed_salary']:.2f}元\n"
+                                     f"课时工资：{result['lesson_salary']:.2f}元\n"
+                                     f"加班工资差额（已包含在课时费中）：{result['overtime_salary']:.2f}元\n"
+                                     f"学生信息费：{result['info_fee']:.2f}元\n\n"
+                                     f"加班明细：\n{overtime_detail}\n"
+                                     f"本月工资：{result['total_salary']:.2f}元\n\n"
+                                     f"分校区统计：\n{location_text}\n\n"
+                                     +"\n".join(f"{k}：{v:.2f}元" for k,v in result["summary"].items())
+                                     +f"\n\n已保存：{path}")
+            overtime_text="\n".join(f"{r['学生姓名']} {r['日期']}：加班{r['实际加班课时']:g}课时，折算{r['三倍折算课时']:g}课时，额外增加{r['额外增加课时']:g}课时，增加{r['加班增加工资']:.2f}元" for r in result.get("overtime_rows", [])) or "本月无加班记录"
+            self.notice("统计完成",f"本月工资：{result['total_salary']:.2f}元\n加班工资差额（已包含在课时费中）：{result['overtime_salary']:.2f}元\n{overtime_text}\nExcel已保存到应用本地目录。")
         except Exception as e:self.notice("计算失败",str(e))
 
     def export_content(self):
@@ -2720,3 +2741,4 @@ class CourseApp(App):
 
 if __name__ == "__main__":
     CourseApp().run()
+
