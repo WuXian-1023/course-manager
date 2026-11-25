@@ -484,7 +484,15 @@ class CourseApp(App):
         self.templates = self.load_templates()
 
         # Android 使用系统文件选择器读取用户主动选择的 Excel 文件（无需广泛存储权限）。
-        self._excel_picker_request_code = 7312
+        # Android 系统文件选择器请求编号，必须互不重复
+        self._excel_picker_request_code = 7312  # 选择 Excel 导入文件
+        self._json_picker_request_code = 7313  # 选择 JSON 恢复文件
+        self._save_picker_request_code = 7314  # 保存 Excel / JSON 文件
+
+        # 暂存等待写入系统文件的内容
+        self._pending_save_bytes = None
+        self._pending_save_filename = ""
+        self._pending_save_title = ""
         if platform == "android":
             try:
                 from android import activity
@@ -2238,43 +2246,122 @@ class CourseApp(App):
 
     def calculate_salary(self):
         try:
-            year=int(self.sal_year.text);month=int(self.sal_month.text)
-            # 传入全部历史记录，才能正确计算跨月自然周的信息费首次归属。
-            rows=self.db.get_records()
-            month_rows=[r for r in rows if parse_date(r["日期"]).year==year and parse_date(r["日期"]).month==month]
-            if not month_rows:self.notice("工资统计","该月没有课程记录");return
-            result=salary_for_month(rows,year,month)
+            year = int(self.sal_year.text)
+            month = int(self.sal_month.text)
+
+            # 传入全部历史记录，保证跨月自然周的信息费首次归属正确。
+            rows = self.db.get_records()
+
+            month_rows = [
+                r for r in rows
+                if parse_date(r["日期"]).year == year
+                and parse_date(r["日期"]).month == month
+            ]
+
+            if not month_rows:
+                self.notice("工资统计", "该月没有课程记录")
+                return
+
+            # 原工资计算公式保持不变。
+            result = salary_for_month(rows, year, month)
+
             from exporter import export_salary
-            path=os.path.join(app_data_dir(),f"{year}年{month}月工资统计.xlsx")
-            path = export_salary(path,result)
-            location_text="\n".join(
-                f"{name}：课时 {v['总课时']:.2f}，课时费 {v['课时费']:.2f}元，信息费 {v['学生信息费']:.2f}元，校区合计 {v['校区合计']:.2f}元"
-                for name,v in result["location_totals"].items()
+
+            filename = f"{year}年{month}月工资统计.xlsx"
+            path = os.path.join(app_data_dir(), filename)
+
+            path = export_salary(path, result)
+
+            location_text = "\n".join(
+                f"{name}：课时 {v['总课时']:.2f}，"
+                f"课时费 {v['课时费']:.2f}元，"
+                f"信息费 {v['学生信息费']:.2f}元，"
+                f"校区合计 {v['校区合计']:.2f}元"
+                for name, v in result["location_totals"].items()
             ) or "暂无校区统计"
-            overtime_detail="\n".join(
-                f"{r['学生姓名']}：{r['日期']} {r['开始时间']}-{r['结束时间']}，实际加班{r['实际加班课时']:g}课时，三倍折算{r['三倍折算课时']:g}课时，额外增加{r['额外增加课时']:g}课时，增加工资{r['加班增加工资']:.2f}元"
-                for r in result.get("overtime_rows", [])) or "本月无加班记录"
-            self.salary_result.text=(f"{year}年{month}月工资统计\n"
-                                     f"固定工资：{result['fixed_salary']:.2f}元\n"
-                                     f"课时工资：{result['lesson_salary']:.2f}元\n"
-                                     f"加班工资差额（已包含在课时费中）：{result['overtime_salary']:.2f}元\n"
-                                     f"学生信息费：{result['info_fee']:.2f}元\n\n"
-                                     f"加班明细：\n{overtime_detail}\n"
-                                     f"本月工资：{result['total_salary']:.2f}元\n\n"
-                                     f"分校区统计：\n{location_text}\n\n"
-                                     +"\n".join(f"{k}：{v:.2f}元" for k,v in result["summary"].items())
-                                     +f"\n\n已保存：{path}")
-            overtime_text="\n".join(f"{r['学生姓名']} {r['日期']}：加班{r['实际加班课时']:g}课时，折算{r['三倍折算课时']:g}课时，额外增加{r['额外增加课时']:g}课时，增加{r['加班增加工资']:.2f}元" for r in result.get("overtime_rows", [])) or "本月无加班记录"
-            self.notice("统计完成",f"本月工资：{result['total_salary']:.2f}元\n加班工资差额（已包含在课时费中）：{result['overtime_salary']:.2f}元\n{overtime_text}\nExcel已保存到应用本地目录。")
-        except Exception as e:self.notice("计算失败",str(e))
+
+            overtime_detail = "\n".join(
+                f"{r['学生姓名']}：{r['日期']} "
+                f"{r['开始时间']}-{r['结束时间']}，"
+                f"实际加班{r['实际加班课时']:g}课时，"
+                f"三倍折算{r['三倍折算课时']:g}课时，"
+                f"额外增加{r['额外增加课时']:g}课时，"
+                f"增加工资{r['加班增加工资']:.2f}元"
+                for r in result.get("overtime_rows", [])
+            ) or "本月无加班记录"
+
+            overtime_text = "\n".join(
+                f"{r['学生姓名']} {r['日期']}："
+                f"加班{r['实际加班课时']:g}课时，"
+                f"折算{r['三倍折算课时']:g}课时，"
+                f"额外增加{r['额外增加课时']:g}课时，"
+                f"增加{r['加班增加工资']:.2f}元"
+                for r in result.get("overtime_rows", [])
+            ) or "本月无加班记录"
+
+            # Android：等待用户选择保存位置。
+            if platform == "android":
+                save_text = "等待选择手机保存位置"
+            else:
+                save_text = f"已保存：{path}"
+
+            self.salary_result.text = (
+                f"{year}年{month}月工资统计\n"
+                f"固定工资：{result['fixed_salary']:.2f}元\n"
+                f"课时工资：{result['lesson_salary']:.2f}元\n"
+                f"加班工资差额（已包含在课时费中）："
+                f"{result['overtime_salary']:.2f}元\n"
+                f"学生信息费：{result['info_fee']:.2f}元\n\n"
+                f"加班明细：\n{overtime_detail}\n"
+                f"本月工资：{result['total_salary']:.2f}元\n\n"
+                f"分校区统计：\n{location_text}\n\n"
+                + "\n".join(
+                    f"{k}：{v:.2f}元"
+                    for k, v in result["summary"].items()
+                )
+                + f"\n\n{save_text}"
+            )
+
+            if platform == "android":
+                self._save_export_file(
+                    path,
+                    filename,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "工资 Excel 导出成功"
+                )
+
+                self.notice(
+                    "工资统计完成",
+                    f"本月工资：{result['total_salary']:.2f}元\n"
+                    f"加班工资差额（已包含在课时费中）："
+                    f"{result['overtime_salary']:.2f}元\n"
+                    f"{overtime_text}\n\n"
+                    "请在接下来的系统窗口中选择 Excel 保存位置。"
+                )
+
+            else:
+                self.notice(
+                    "统计完成",
+                    f"本月工资：{result['total_salary']:.2f}元\n"
+                    f"加班工资差额（已包含在课时费中）："
+                    f"{result['overtime_salary']:.2f}元\n"
+                    f"{overtime_text}\n\n"
+                    f"Excel 已保存：{path}"
+                )
+
+        except Exception as exc:
+            self.notice("计算失败", str(exc))
 
     def export_content(self):
         c=self.column(dp(10));c.padding=dp(8)
-        c.add_widget(self.label("Excel 文件会保存在应用本地目录。可通过 Android 文件管理器的应用文件访问方式取出；具体路径因 Android 版本而异。",100))
+        c.add_widget(self.label(
+            "导出 Excel 和 JSON 时可选择手机保存位置；恢复 JSON 时可从手机文件中选择备份。",
+            100
+        ))
         c.add_widget(self.button("导出全部课程记录 Excel",self.export_records,54))
         c.add_widget(self.button("从 Excel 导入课程记录",self.choose_excel_import,54,"green"))
         c.add_widget(self.label("Excel 导入采用追加方式，不覆盖已有课程；完全相同的记录会自动跳过。",54,COLORS["text_secondary"],"12sp"))
-        c.add_widget(self.button("生成本地 JSON 备份",self.backup_json,54))
+        c.add_widget(self.button("导出 JSON 备份文件",self.backup_json,54))
         c.add_widget(self.button("从 JSON 备份恢复",self.restore_json,54))
         c.add_widget(self.section_title("软件更新"))
         c.add_widget(self.label(f"当前版本：{APP_VERSION}。更新来自项目 GitHub Releases；安装新版时不要卸载旧版。", 64))
@@ -2410,68 +2497,253 @@ class CourseApp(App):
             self.notice("无法选择 Excel 文件", f"请确认桌面环境可用，然后重试。\n{exc}")
 
     def _on_android_activity_result(self, request_code, result_code, intent):
-        """Receive the document URI, then process it on Kivy's UI thread."""
+        """统一处理 Android 文件选择和保存结果。"""
         try:
             request_code = int(request_code)
         except Exception:
-            pass
-        if request_code != self._excel_picker_request_code:
             return
 
-        print(f"[ExcelImport] Activity result: request={request_code}, result={result_code}")
-        if int(result_code) != -1:  # Activity.RESULT_OK
-            print("[ExcelImport] User cancelled document picker")
+        if request_code not in (
+            self._excel_picker_request_code,
+            self._json_picker_request_code,
+            self._save_picker_request_code,
+        ):
             return
+
+        # 用户取消操作
+        if int(result_code) != -1:
+            print(f"[FilePicker] User cancelled: request={request_code}")
+            self._pending_save_bytes = None
+            return
+
         if intent is None:
             Clock.schedule_once(
-                lambda _dt: self.notice("Excel 文件读取失败", "系统没有返回所选文件信息，请重新选择。"), 0
+                lambda _dt: self.notice("文件操作失败", "系统没有返回文件信息，请重试。"),
+                0
             )
             return
 
         try:
             uri = intent.getData()
             if uri is None:
-                raise ValueError("系统没有返回文件 URI，请从文件管理器重新选择 .xlsx 文件。")
-            # UI widgets must be updated on Kivy's main thread. Keep the Java URI
-            # alive in the scheduled callback rather than parsing inside the
-            # Android activity-result callback.
-            Clock.schedule_once(lambda _dt, selected_uri=uri: self._read_android_excel_uri(selected_uri), 0)
-        except Exception as exc:
-            print(f"[ExcelImport] Failed to receive URI: {exc}")
-            Clock.schedule_once(lambda _dt, error=str(exc): self.notice("Excel 文件读取失败", error), 0)
+                raise ValueError("系统没有返回有效的文件 URI。")
 
-    def _read_android_excel_uri(self, uri):
-        """Read a content:// URI using ContentResolver without filesystem paths."""
-        stream = None
+            if request_code == self._save_picker_request_code:
+                Clock.schedule_once(
+                    lambda _dt, selected_uri=uri: self._write_android_uri(selected_uri),
+                    0
+                )
+
+            elif request_code == self._excel_picker_request_code:
+                Clock.schedule_once(
+                    lambda _dt, selected_uri=uri: self._read_android_excel_uri(selected_uri),
+                    0
+                )
+
+            elif request_code == self._json_picker_request_code:
+                Clock.schedule_once(
+                    lambda _dt, selected_uri=uri: self._read_android_json_uri(selected_uri),
+                    0
+                )
+
+        except Exception as exc:
+            print(f"[FilePicker] Activity result error: {exc}")
+            Clock.schedule_once(
+                lambda _dt, error=str(exc): self.notice("文件操作失败", error),
+                0
+            )
+
+    def _open_android_save_picker(self, raw, filename, mime_type, success_title):
+        """打开 Android 系统保存窗口，保存指定字节内容。"""
         try:
             from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            Intent = autoclass("android.content.Intent")
+
+            self._pending_save_bytes = bytes(raw)
+            self._pending_save_filename = filename
+            self._pending_save_title = success_title
+
+            intent = Intent(Intent.ACTION_CREATE_DOCUMENT)
+            intent.addCategory(Intent.CATEGORY_OPENABLE)
+            intent.setType(mime_type)
+            intent.putExtra(Intent.EXTRA_TITLE, filename)
+
+            print(f"[FilePicker] Opening save picker: {filename}")
+
+            PythonActivity.mActivity.startActivityForResult(
+                intent,
+                self._save_picker_request_code
+            )
+
+        except Exception as exc:
+            self._pending_save_bytes = None
+            self.notice("无法打开保存窗口", str(exc))
+
+    def _write_android_uri(self, uri):
+        """将暂存的文件内容写入 Android 系统返回的 content URI。"""
+        stream = None
+
+        try:
+            from jnius import autoclass
+
             PythonActivity = autoclass("org.kivy.android.PythonActivity")
             resolver = PythonActivity.mActivity.getContentResolver()
-            stream = resolver.openInputStream(uri)
-            if stream is None:
-                raise IOError("Android 无法打开该文件。请确认文件可访问，或先保存到手机本地。")
 
-            # Read byte-by-byte. This avoids Pyjnius byte[] overload/conversion
-            # differences seen across Android versions and document providers.
-            raw = bytearray()
-            while True:
-                value = stream.read()
-                if value == -1:
-                    break
-                raw.append(value & 0xFF)
-            if not raw:
-                raise ValueError("所选文件为空。")
-            print(f"[ExcelImport] Read {len(raw)} bytes from selected document")
-            self._load_excel_bytes(bytes(raw))
+            raw = self._pending_save_bytes
+            filename = self._pending_save_filename
+            success_title = self._pending_save_title
+
+            if raw is None:
+                raise ValueError("没有找到等待保存的文件内容，请重新导出。")
+
+            stream = resolver.openOutputStream(uri)
+
+            if stream is None:
+                raise IOError("Android 无法创建目标文件，请更换保存位置。")
+
+            # 逐字节写入，避免不同 Android / Pyjnius 版本的 byte[] 转换差异。
+            for value in raw:
+                stream.write(int(value))
+
+            stream.flush()
+
+            self._pending_save_bytes = None
+            self._pending_save_filename = ""
+            self._pending_save_title = ""
+
+            self.export_status.text = f"保存成功：{filename}"
+            self.notice(
+                success_title or "保存成功",
+                f"文件已保存：{filename}"
+            )
+
+            print(f"[FilePicker] Saved {len(raw)} bytes: {filename}")
+
         except Exception as exc:
-            print(f"[ExcelImport] Read/parse failed: {exc}")
-            self.notice("Excel 文件读取失败", f"{exc}\n\n请确认选择的是 .xlsx 格式文件。")
+            print(f"[FilePicker] Write failed: {exc}")
+            self.notice("文件保存失败", str(exc))
+
         finally:
             if stream is not None:
                 try:
                     stream.close()
                 except Exception:
                     pass
+
+    def _read_android_excel_uri(self, uri):
+        """通过 ContentResolver 读取 Excel 文件。"""
+        stream = None
+
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            resolver = PythonActivity.mActivity.getContentResolver()
+
+            stream = resolver.openInputStream(uri)
+
+            if stream is None:
+                raise IOError("Android 无法打开该文件。")
+
+            raw = bytearray()
+
+            while True:
+                value = stream.read()
+
+                if value == -1:
+                    break
+
+                raw.append(value & 0xFF)
+
+            if not raw:
+                raise ValueError("所选 Excel 文件为空。")
+
+            print(f"[ExcelImport] Read {len(raw)} bytes")
+
+            self._load_excel_bytes(bytes(raw))
+
+        except Exception as exc:
+            print(f"[ExcelImport] Read failed: {exc}")
+            self.notice(
+                "Excel 文件读取失败",
+                f"{exc}\n\n请确认选择的是有效的 .xlsx 文件。"
+            )
+
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+    def _read_android_json_uri(self, uri):
+        """读取用户选择的 JSON 备份，并交给统一恢复流程验证。"""
+        stream = None
+
+        try:
+            from jnius import autoclass
+
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            resolver = PythonActivity.mActivity.getContentResolver()
+
+            stream = resolver.openInputStream(uri)
+
+            if stream is None:
+                raise IOError("Android 无法打开该 JSON 文件。")
+
+            raw = bytearray()
+
+            while True:
+                value = stream.read()
+
+                if value == -1:
+                    break
+
+                raw.append(value & 0xFF)
+
+            if not raw:
+                raise ValueError("JSON 备份文件为空。")
+
+            data = json.loads(bytes(raw).decode("utf-8-sig"))
+
+            self._restore_json_data(data)
+
+        except Exception as exc:
+            print(f"[JSONRestore] Read failed: {exc}")
+            self.notice("恢复失败", str(exc))
+
+        finally:
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+    def _save_export_file(self, path, filename, mime_type, success_title):
+        """读取 exporter 生成的文件，再交给 Android 保存窗口。"""
+        try:
+            with open(path, "rb") as file:
+                raw = file.read()
+
+            if not raw:
+                raise IOError("生成的文件为空。")
+
+            self._open_android_save_picker(
+                raw,
+                filename,
+                mime_type,
+                success_title
+            )
+
+        finally:
+            # Android 已经把文件内容读入内存，不再需要私有目录中的临时文件。
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError as exc:
+                print(f"[FilePicker] Temporary file cleanup failed: {exc}")
 
     def _load_excel_path(self, path):
         try:
@@ -2639,101 +2911,256 @@ class CourseApp(App):
     def export_records(self):
         try:
             from exporter import export_records
-            path=os.path.join(app_data_dir(),"MonthlyRecord.xlsx")
-            path = export_records(path,self.db.get_records())
-            self.export_status.text=f"导出成功：{path}"
-            self.notice("导出成功",path)
-        except Exception as e:self.notice("导出失败",str(e))
+
+            filename = "MonthlyRecord.xlsx"
+            path = os.path.join(app_data_dir(), filename)
+
+            path = export_records(
+                path,
+                self.db.get_records()
+            )
+
+            if platform == "android":
+                self._save_export_file(
+                    path,
+                    filename,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "课程记录 Excel 导出成功"
+                )
+
+                self.notice(
+                    "导出完成",
+                    "请在接下来的系统窗口中选择 Excel 保存位置。"
+                )
+
+            else:
+                self.export_status.text = f"导出成功：{path}"
+                self.notice("导出成功", path)
+
+        except Exception as exc:
+            self.notice("导出失败", str(exc))
     def backup_json(self):
-        """生成包含课程、模板和节假日配置的本地 JSON 备份。"""
-        path = Path(app_data_dir()) / "course_backup.json"
-        temp_path = path.with_name(path.name + ".tmp")
+        """生成包含课程、模板和节假日配置的 JSON 备份。"""
+
+        filename = "course_backup.json"
+
         data = {
             "backup_version": 2,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "records": self.db.get_records(),
             "templates": self.templates,
-            "holidays": [x.isoformat() for x in sorted(self.holidays)],
+            "holidays": [
+                x.isoformat()
+                for x in sorted(self.holidays)
+            ],
         }
+
         try:
-            with open(temp_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(str(temp_path), str(path))
-            self.export_status.text = f"备份成功：{path}"
-            self.notice("备份成功", str(path))
+            raw = json.dumps(
+                data,
+                ensure_ascii=False,
+                indent=2
+            ).encode("utf-8")
+
+            if platform == "android":
+                self._open_android_save_picker(
+                    raw,
+                    filename,
+                    "application/json",
+                    "JSON 备份成功"
+                )
+
+                self.notice(
+                    "准备备份",
+                    "请在接下来的系统窗口中选择 JSON 备份文件的保存位置。"
+                )
+
+            else:
+                path = Path(app_data_dir()) / filename
+                temp_path = path.with_name(path.name + ".tmp")
+
+                try:
+                    with open(temp_path, "wb") as f:
+                        f.write(raw)
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                    os.replace(str(temp_path), str(path))
+
+                except Exception:
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    raise
+
+                self.export_status.text = f"备份成功：{path}"
+                self.notice("备份成功", str(path))
+
         except Exception as exc:
-            try:
-                temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
             self.notice("备份失败", str(exc))
 
     def restore_json(self):
-        """先验证 JSON，再备份当前数据库，最后安全恢复记录与配置。"""
+        """选择 JSON 文件，验证后恢复课程、模板和节假日配置。"""
+
+        if platform == "android":
+            try:
+                from jnius import autoclass
+
+                PythonActivity = autoclass(
+                    "org.kivy.android.PythonActivity"
+                )
+                Intent = autoclass("android.content.Intent")
+
+                intent = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                intent.setType("application/json")
+                intent.addCategory(Intent.CATEGORY_OPENABLE)
+                intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+                PythonActivity.mActivity.startActivityForResult(
+                    intent,
+                    self._json_picker_request_code
+                )
+
+            except Exception as exc:
+                self.notice("无法打开备份文件选择器", str(exc))
+
+            return
+
+        # 桌面端保留原来的本地备份路径。
         path = Path(app_data_dir()) / "course_backup.json"
+
         if not path.exists():
-            self.notice("未找到备份", "请先在本机生成备份文件。")
+            self.notice(
+                "未找到备份",
+                "请先生成 JSON 备份文件。"
+            )
             return
 
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
 
+            self._restore_json_data(data)
+
+        except Exception as exc:
+            self.notice("恢复失败", str(exc))
+
+    def _restore_json_data(self, data):
+        """验证 JSON 数据，并安全恢复课程记录和配置。"""
+
+        try:
             if not isinstance(data, dict):
-                raise ValueError("备份文件格式错误：根节点必须是对象。")
+                raise ValueError(
+                    "备份文件格式错误：根节点必须是对象。"
+                )
 
             records = data.get("records", [])
-            templates = data.get("templates", {"weekly_templates": [], "teachers": {}})
-            holidays_raw = data.get("holidays", [x.isoformat() for x in sorted(self.holidays)])
+
+            templates = data.get(
+                "templates",
+                {
+                    "weekly_templates": [],
+                    "teachers": {}
+                }
+            )
+
+            holidays_raw = data.get(
+                "holidays",
+                [
+                    x.isoformat()
+                    for x in sorted(self.holidays)
+                ]
+            )
 
             if not isinstance(records, list):
-                raise ValueError("备份中的 records 必须是列表。")
+                raise ValueError(
+                    "备份中的 records 必须是列表。"
+                )
+
             if not isinstance(templates, dict):
-                raise ValueError("备份中的 templates 必须是对象。")
-            if not isinstance(templates.get("weekly_templates", []), list):
+                raise ValueError(
+                    "备份中的 templates 必须是对象。"
+                )
+
+            if not isinstance(
+                templates.get("weekly_templates", []),
+                list
+            ):
                 raise ValueError("课程模板列表格式错误。")
-            if not isinstance(templates.get("teachers", {}), dict):
+
+            if not isinstance(
+                templates.get("teachers", {}),
+                dict
+            ):
                 raise ValueError("教师配置格式错误。")
+
             if not isinstance(holidays_raw, list):
                 raise ValueError("节假日配置必须是日期列表。")
 
             # 预先解析所有日期，避免恢复到一半才发现配置错误。
-            holidays = {parse_date(x) for x in holidays_raw}
+            holidays = {
+                parse_date(x)
+                for x in holidays_raw
+            }
 
-            # 先为当前数据库生成快照，再准备新配置文件。
+            # 先为当前数据库生成快照。
             db_backup = self.db.create_backup(keep=20)
+
             old_templates = self.templates
             old_holidays = set(self.holidays)
 
-            # 模板和节假日先原子写入；失败时尽力恢复旧配置，数据库尚未替换。
+            # 配置先写入；失败时恢复旧配置。
             try:
                 self.templates = templates
                 self.persist_templates()
-                save_holidays(holidays, self.holidays_path)
 
-                # 数据库替换在单一 SQLite 事务中完成，避免半份记录。
-                self.db.replace_records(records, backup=False)
+                save_holidays(
+                    holidays,
+                    self.holidays_path
+                )
+
+                # 数据库替换仍然使用原来的事务机制。
+                self.db.replace_records(
+                    records,
+                    backup=False
+                )
+
             except Exception:
                 self.templates = old_templates
+
                 try:
                     self.persist_templates()
-                    save_holidays(old_holidays, self.holidays_path)
+
+                    save_holidays(
+                        old_holidays,
+                        self.holidays_path
+                    )
+
                 except Exception as rollback_exc:
-                    print(f"恢复配置回滚失败，请检查本地模板/节假日文件：{rollback_exc}")
+                    print(
+                        "恢复配置回滚失败，请检查本地模板/节假日文件："
+                        f"{rollback_exc}"
+                    )
+
                 raise
 
             self.holidays = holidays
             set_holidays(holidays)
+
             if hasattr(self, "template_box"):
                 self.refresh_templates()
+
             if hasattr(self, "holiday_field"):
-                self.holiday_field.input.text = "、".join(x.isoformat() for x in sorted(holidays))
+                self.holiday_field.input.text = "、".join(
+                    x.isoformat()
+                    for x in sorted(holidays)
+                )
 
             self.notice(
                 "恢复完成",
-                f"课程记录和配置已恢复。\n恢复前数据库备份：{db_backup}"
+                f"课程记录和配置已恢复。\n"
+                f"恢复前数据库备份：{db_backup}"
             )
 
         except Exception as exc:
