@@ -71,6 +71,9 @@ MONEY_COLUMNS = {
     "课时费",
     "本月工资合计",
     "课时工资",
+    "加班增加工资",
+    "学生信息费",
+    "校区合计",
 }
 
 # 课时字段
@@ -78,6 +81,9 @@ HOUR_COLUMNS = {
     "正常课时",
     "三倍课时",
     "总课时",
+    "实际加班课时",
+    "三倍折算课时",
+    "额外增加课时",
 }
 
 # 数字字段
@@ -447,6 +453,14 @@ def export_salary(path, result):
     )
 
     # -------------------------------------------------
+    # 加班明细
+    # -------------------------------------------------
+    overtime_ws = wb.create_sheet("加班明细")
+    overtime_headers = ["学生姓名", "日期", "开始时间", "结束时间", "实际加班课时", "三倍折算课时",
+                        "额外增加课时", "匹配年级", "匹配学生人数", "课时单价", "加班增加工资"]
+    _write_sheet(overtime_ws, overtime_headers, result.get("overtime_rows", []))
+
+    # -------------------------------------------------
     # 分类汇总
     # -------------------------------------------------
 
@@ -462,32 +476,25 @@ def export_salary(path, result):
 
         data = []
 
-        for name, values in result.get(
-            key,
-            {}
-        ).items():
+        for name, values in result.get(key, {}).items():
+            if key == "location_totals":
+                data.append({
+                    "校区": name,
+                    "总课时": round(float(values.get("总课时", 0)), 2),
+                    "课时费": round(float(values.get("课时费", 0)), 2),
+                    "学生信息费": round(float(values.get("学生信息费", 0)), 2),
+                    "校区合计": round(float(values.get("校区合计", 0)), 2),
+                })
+            else:
+                data.append({
+                    "分类": name,
+                    "总课时": round(float(values[0]), 2),
+                    "课时工资": round(float(values[1]), 2),
+                })
 
-            data.append({
-                "分类": name,
-                "总课时": round(
-                    float(values[0]),
-                    2
-                ),
-                "课时工资": round(
-                    float(values[1]),
-                    2
-                ),
-            })
-
-        _write_sheet(
-            sheet,
-            [
-                "分类",
-                "总课时",
-                "课时工资"
-            ],
-            data
-        )
+        headers = (["校区", "总课时", "课时费", "学生信息费", "校区合计"]
+                   if key == "location_totals" else ["分类", "总课时", "课时工资"])
+        _write_sheet(sheet, headers, data)
 
     return _save_workbook(
         wb,

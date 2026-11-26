@@ -16,6 +16,8 @@
 from datetime import datetime, date, time
 import json
 from pathlib import Path
+import re
+from datetime import timedelta
 
 
 # =====================================================
@@ -330,117 +332,198 @@ def calculate_one_record(row):
 # 月工资统计
 # =====================================================
 
-def salary_for_month(rows, year, month):
+def _split_student_names(value):
+    """按支持的分隔符拆分学生姓名，并去除姓名内部空白。"""
+    names = set()
+    for part in re.split(r"[、，,;；\n\r]+", str(value or "")):
+        name = re.sub(r"\s+", "", part.strip())
+        if name:
+            names.add(name)
+    return names
 
-    if not 1 <= int(month) <= 12:
+
+def _match_overtime_course(overtime, course_rows):
+    """按学生姓名匹配课程；优先同日，再按日期/开始时间距离选择最近记录。"""
+    student = re.sub(r"\s+", "", str(overtime.get("学生姓名", "")).strip())
+    overtime_date = parse_date(overtime["日期"])
+    candidates = [r for r in course_rows
+                  if student in _split_student_names(r.get("学生姓名"))
+                  and parse_date(r["日期"]).year == overtime_date.year
+                  and parse_date(r["日期"]).month == overtime_date.month]
+    if not candidates:
+        raise ValueError(f"加班记录“{student}”找不到对应课程记录，无法确定年级和学生人数。")
+    od = overtime_date
+    try:
+        ot = parse_time(overtime.get("开始时间") or "00:00")
+    except ValueError:
+        ot = time.min
+    def distance(row):
+        rd = parse_date(row["日期"])
+        try:
+            rt = parse_time(row.get("开始时间") or "00:00")
+        except ValueError:
+            rt = time.min
+        return (abs((rd - od).days), abs((datetime.combine(date.min, rt)-datetime.combine(date.min, ot)).total_seconds()))
+    candidates.sort(key=distance)
+    best_distance = distance(candidates[0])
+    tied = [r for r in candidates if distance(r) == best_distance]
+    signatures = {(str(r.get("年级", "")), str(r.get("学生人数", "1"))) for r in tied}
+    if len(signatures) > 1:
+        raise ValueError(f"加班记录“{student}”对应多条课程的年级/学生人数不同，请检查该日期课程记录。")
+    return tied[0]
+
+
+def salary_for_month(rows, year, month, overtime_records=None):
+    """按月计算工资；信息费按自然周首次上课日期及校区归属。
+
+    rows 必须传入完整历史课程记录，才能正确识别跨月自然周的首次上课记录。
+    三倍课时自动作为加班课时；overtime_records 参数仅为旧版本兼容，不再使用。
+    """
+    year, month = int(year), int(month)
+    if not 1 <= month <= 12:
         raise ValueError("月份必须在 1 到 12 之间。")
 
+    all_rows = [dict(source) for source in rows]
+    # 先按日期、开始时间和原始顺序排序，确定同一学生每周真正的首次上课地点。
+    ordered_rows = []
+    for index, row in enumerate(all_rows):
+        d = parse_date(row["日期"])
+        try:
+            start = parse_time(row.get("开始时间") or "00:00")
+        except (TypeError, ValueError):
+            start = time.min
+        ordered_rows.append((d, start, index, row))
+    ordered_rows.sort(key=lambda item: (item[0], item[1], item[2]))
+
+    first_lessons = {}
+    for d, _start, _index, row in ordered_rows:
+        week_start = d - timedelta(days=d.weekday())
+        location = str(row.get("地点") or "未填写").strip() or "未填写"
+        for student in _split_student_names(row.get("学生姓名")):
+            key = (week_start, student)
+            if key not in first_lessons:
+                first_lessons[key] = {"date": d, "location": location}
+
     month_rows = []
-
     lesson_salary = 0.0
-
     location_totals = {}
     grade_totals = {}
     type_totals = {}
 
-    for source in rows:
+    def ensure_location(name):
+        if name not in location_totals:
+            location_totals[name] = {
+                "总课时": 0.0,
+                "课时费": 0.0,
+                "学生信息费": 0.0,
+                "校区合计": 0.0,
+            }
+        return location_totals[name]
 
-        d = parse_date(source["日期"])
-
+    for d, _start, _index, source in ordered_rows:
         if d.year != year or d.month != month:
             continue
-
         row = dict(source)
-
         calc = calculate_one_record(row)
-
         row.update(calc)
-
         try:
-
-            people = max(
-                1,
-                int(float(row.get("学生人数") or 1))
-            )
-
+            people = max(1, int(float(row.get("学生人数") or 1)))
         except (TypeError, ValueError):
-
             people = 1
-
-        price = LESSON_PRICE.get(
-            row.get("年级", ""),
-            0
-        )
-
+        price = LESSON_PRICE.get(row.get("年级", ""), 0)
         extra = (people - 1) * 10
-
-        wage = round(
-            float(calc["总课时"]) *
-            (price + extra) *
-            2 / 3,
-            2
-        )
-
+        # 保留原有课时工资公式，不做任何调整。
+        wage = round(float(calc["总课时"]) * (price + extra) * 2 / 3, 2)
         row["课时单价"] = price
         row["课时工资"] = wage
-
         lesson_salary += wage
-
         month_rows.append(row)
 
-        for target, key in (
-            (location_totals, "地点"),
-            (grade_totals, "年级"),
-            (type_totals, "课程类型"),
-        ):
+        location = str(row.get("地点") or "未填写").strip() or "未填写"
+        loc = ensure_location(location)
+        loc["总课时"] += float(calc["总课时"])
+        loc["课时费"] += wage
 
-            label = str(
-                row.get(key, "") or "未填写"
-            )
-
+        for target, key in ((grade_totals, "年级"), (type_totals, "课程类型")):
+            label = str(row.get(key, "") or "未填写")
             if label not in target:
                 target[label] = [0.0, 0.0]
-
-            target[label][0] += float(
-                calc["总课时"]
-            )
-
+            target[label][0] += float(calc["总课时"])
             target[label][1] += wage
 
-    fixed = (
-        BASIC_SALARY
-        + LATE_SUPPORT
-        + (
-            FULL_ATTENDANCE
-            if IS_FULL_ATTENDANCE
-            else 0
-        )
-        + TEACHER_CERTIFICATE
-    )
+    # 信息费仅归属首次上课日期所在月份；同周跨校区/跨月均不重复收取。
+    info_fee_weeks = {}
+    for (week_start, student), first in sorted(first_lessons.items(), key=lambda item: (item[0][0], item[0][1])):
+        first_date = first["date"]
+        if first_date.year != year or first_date.month != month:
+            continue
+        week = info_fee_weeks.setdefault(week_start, {"students": [], "count": 0, "fee": 0.0, "locations": {}})
+        week["students"].append(student)
+        week["locations"].setdefault(first["location"], []).append(student)
+        loc = ensure_location(first["location"])
+        loc["学生信息费"] += 10.0
 
+    for week_start, item in sorted(info_fee_weeks.items()):
+        item["students"] = sorted(set(item["students"]))
+        item["count"] = len(item["students"])
+        item["fee"] = round(item["count"] * 10.0, 2)
+        item["locations"] = {
+            name: {"students": sorted(set(names)), "count": len(set(names)), "fee": round(len(set(names)) * 10.0, 2)}
+            for name, names in sorted(item["locations"].items())
+        }
+
+    for values in location_totals.values():
+        for key in values:
+            values[key] = round(values[key], 2)
+        values["校区合计"] = round(values["课时费"] + values["学生信息费"], 2)
+
+    # 三倍课时栏只要大于 0，就视为加班课时。
+    # 课程课时工资已经按“正常课时 + 三倍课时×3”计入，因此这里仅统计
+    # 相比普通课时多出的 (3-1) 倍工资用于展示，不再重复加到月工资。
+    overtime_rows = []
+    overtime_salary = 0.0
+    for row in month_rows:
+        triple_hours = number_or_none(row.get("三倍课时")) or 0.0
+        if triple_hours <= 0:
+            continue
+        people = max(1, int(float(row.get("学生人数") or 1)))
+        grade = str(row.get("年级", ""))
+        price = LESSON_PRICE.get(grade, 0)
+        if price <= 0:
+            raise ValueError(f"课程记录 {row.get('日期', '')} {row.get('开始时间', '')} 的年级“{grade}”无法确定课时单价。")
+        converted_hours = triple_hours * 3
+        extra_hours = converted_hours - triple_hours
+        wage = round(extra_hours * (price + (people - 1) * 10) * 2 / 3, 2)
+        overtime_salary += wage
+        overtime_rows.append({
+            "学生姓名": row.get("学生姓名", ""),
+            "日期": row.get("日期", ""),
+            "开始时间": row.get("开始时间", ""),
+            "结束时间": row.get("结束时间", ""),
+            "实际加班课时": round(triple_hours, 2),
+            "三倍折算课时": round(converted_hours, 2),
+            "额外增加课时": round(extra_hours, 2),
+            "匹配年级": grade,
+            "匹配学生人数": people,
+            "课时单价": price,
+            "加班增加工资": wage,
+        })
+
+    overtime_salary = round(overtime_salary, 2)
+    info_fee = round(sum(item["fee"] for item in info_fee_weeks.values()), 2)
+    fixed = BASIC_SALARY + LATE_SUPPORT + (FULL_ATTENDANCE if IS_FULL_ATTENDANCE else 0) + TEACHER_CERTIFICATE
     summary = {
         "基本工资": BASIC_SALARY,
         "晚托": LATE_SUPPORT,
-        "全勤": (
-            FULL_ATTENDANCE
-            if IS_FULL_ATTENDANCE
-            else 0
-        ),
+        "全勤": FULL_ATTENDANCE if IS_FULL_ATTENDANCE else 0,
         "教师资格证补贴": TEACHER_CERTIFICATE,
         "课时费": round(lesson_salary, 2),
-        "本月工资合计": round(
-            fixed + lesson_salary,
-            2
-        ),
+        "加班增加工资（已包含在课时费中）": overtime_salary,
+        "学生信息费": info_fee,
+        "本月工资合计": round(fixed + lesson_salary + info_fee, 2),
     }
 
-    # 汇总数字统一保留两位小数
-    for target in (
-        location_totals,
-        grade_totals,
-        type_totals
-    ):
-
+    for target in (grade_totals, type_totals):
         for value in target.values():
             value[0] = round(value[0], 2)
             value[1] = round(value[1], 2)
@@ -449,14 +532,12 @@ def salary_for_month(rows, year, month):
         "rows": month_rows,
         "summary": summary,
         "fixed_salary": fixed,
-        "lesson_salary": round(
-            lesson_salary,
-            2
-        ),
-        "total_salary": round(
-            fixed + lesson_salary,
-            2
-        ),
+        "lesson_salary": round(lesson_salary, 2),
+        "total_salary": round(fixed + lesson_salary + info_fee, 2),
+        "overtime_salary": overtime_salary,
+        "overtime_rows": overtime_rows,
+        "info_fee": info_fee,
+        "info_fee_weeks": info_fee_weeks,
         "location_totals": location_totals,
         "grade_totals": grade_totals,
         "type_totals": type_totals,
